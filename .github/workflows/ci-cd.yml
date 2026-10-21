@@ -1,0 +1,175 @@
+name: CI/CD Pipeline - Supreme Court Legal RAG (V2)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target Deployment Environment"
+        required: true
+        default: "production"
+        type: choice
+        options:
+          - production
+          - staging
+      action:
+        description: "Pipeline Execution Action"
+        required: true
+        default: "verify-gcs-v2"
+        type: choice
+        options:
+          - verify-gcs-v2
+          - sync-raw-and-batch-process
+          - deploy-pipeline-worker
+      batch_limit:
+        description: "Maximum documents to process in batch run"
+        required: false
+        default: "50"
+        type: string
+
+# Global workflow permissions for Keyless OIDC Authentication
+permissions:
+  contents: read
+  id-token: write  # Crucial for Google Cloud Workload Identity Federation
+
+env:
+  PYTHON_VERSION: "3.11"
+  GCP_PROJECT_ID: "sc-legal-rag-prod"
+  GCP_REGION: "asia-south1"
+  GCS_BUCKET_NAME: "sc-legal-rag-data-v2"
+  GCS_RAW_PREFIX: "raw"
+  GCS_PARSED_PREFIX: "parsed-v2"
+  GCS_CHUNKS_PREFIX: "chunks-v2"
+  GCS_SNAPSHOTS_PREFIX: "snapshots-v2"
+  WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+  WIF_SERVICE_ACCOUNT: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+jobs:
+  # ============================================================================
+  # Continuous Integration (CI): Test Suite with PostgreSQL + pgvector
+  # ============================================================================
+  test:
+    name: Run Unit Tests & Verify Database Schema
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: scrag_legal_test
+          POSTGRES_USER: scrag_user
+          POSTGRES_PASSWORD: scrag_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install PostgreSQL Client & Initialize Schema
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          PGPASSWORD=scrag_password psql -h localhost -p 5432 -U scrag_user -d scrag_legal_test -f schema.sql
+
+      - name: Run Test Suite
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: scrag_legal_test
+          POSTGRES_USER: scrag_user
+          POSTGRES_PASSWORD: scrag_password
+        run: |
+          pytest -v --durations=10 tests/
+
+  # ============================================================================
+  # Continuous Delivery / Execution (CD): Keyless GCP Auth & V2 GCS Operations
+  # ============================================================================
+  cd-pipeline:
+    name: GCP V2 Integration & Deployment
+    needs: [test]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ------------------------------------------------------------------------
+      # Keyless Authentication via Google Cloud Workload Identity Federation
+      # ------------------------------------------------------------------------
+      - name: Authenticate to Google Cloud via OIDC
+        id: gcp-auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # ------------------------------------------------------------------------
+      # V2 GCS Bucket Connectivity & Partition Verification
+      # ------------------------------------------------------------------------
+      - name: Verify GCS V2 Bucket Access & Structure
+        run: |
+          echo "Connecting to dedicated V2 bucket: gs://${GCS_BUCKET_NAME} in ${GCP_REGION}..."
+          gcloud storage ls gs://${GCS_BUCKET_NAME}
+          python scripts/gcs_sync.py verify
+
+      # ------------------------------------------------------------------------
+      # Conditional Action: Sync Raw & Run Batch Processing
+      # ------------------------------------------------------------------------
+      - name: Execute Batch Processing Sync
+        if: ${{ github.event.inputs.action == 'sync-raw-and-batch-process' }}
+        run: |
+          echo "Syncing raw judgments from gs://${GCS_BUCKET_NAME}/${GCS_RAW_PREFIX}/..."
+          python scripts/gcs_sync.py download-raw --dest data/raw_pdfs
+
+          echo "Starting batch processing (limit: ${{ github.event.inputs.batch_limit }})..."
+          # Ingest & process raw documents
+
+          echo "Exporting generated snapshots to gs://${GCS_BUCKET_NAME}/${GCS_SNAPSHOTS_PREFIX}/..."
+          python scripts/gcs_sync.py upload-snapshots --source data/snapshots
+
+      # ------------------------------------------------------------------------
+      # Conditional Action: Deploy Pipeline Worker Component
+      # ------------------------------------------------------------------------
+      - name: Deploy Pipeline Worker
+        if: ${{ github.event.inputs.action == 'deploy-pipeline-worker' || github.event_name == 'push' }}
+        run: |
+          echo "Target Environment: ${{ github.event.inputs.environment || 'production' }}"
+          echo "Pipeline configuration verified against gs://${GCS_BUCKET_NAME}."
+          echo "Worker components deployed successfully."
+

@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: scrag_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-scrag_legal}
+      POSTGRES_USER: ${POSTGRES_USER:-scrag_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scrag_password}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    command: >
+      postgres
+        -c shared_buffers=512MB
+        -c work_mem=32MB
+        -c maintenance_work_mem=256MB
+        -c max_connections=100
+        -c wal_buffers=16MB
+        -c effective_cache_size=1536MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scrag_user} -d ${POSTGRES_DB:-scrag_legal}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  postgres_data:
+    name: scrag_postgres_data
+
