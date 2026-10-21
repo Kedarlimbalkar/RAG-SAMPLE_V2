@@ -29,6 +29,7 @@ from scrag.embedder import LocalEmbedder, embedder
 from scrag.ids import compute_sha256, generate_doc_id
 from scrag.models import DocumentRecord
 from scrag.parser import DocumentParseResult, SupremeCourtParser
+from scrag.tracker import ExecutionTracker, tracker
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class LegalRAGPipeline:
         self.parser = SupremeCourtParser(self.cfg)
         self.chunker = HierarchicalChunker(self.cfg)
         self.embedder = embedder
+        self.tracker = tracker
         self.cfg.ensure_directories()
 
     # --------------------------------------------------------------------------
@@ -54,6 +56,7 @@ class LegalRAGPipeline:
         from_gcs: bool = False,
         limit: Optional[int] = None,
         resume: bool = True,
+        year: Optional[str] = None,
     ) -> Dict[str, int]:
         """
         Execute batch processing on raw PDF documents.
@@ -62,7 +65,8 @@ class LegalRAGPipeline:
             source_dir: Local path containing raw PDFs (default: data/raw_pdfs).
             from_gcs: If True, pulls raw PDFs from gs://sc-legal-rag-data-v2/raw/.
             limit: Maximum documents to process in this run.
-            resume: If True, picks up unfinished documents from database.
+            resume: If True, picks up unfinished documents from database state.
+            year: Optional year partition filter (e.g. '1950').
 
         Returns:
             Dict[str, int]: Processing outcome metrics.
@@ -71,12 +75,12 @@ class LegalRAGPipeline:
 
         # 1. Optionally sync inbound raw PDFs from GCS
         if from_gcs:
-            self._pull_raw_from_gcs()
+            self._pull_raw_from_gcs(year=year)
 
         # 2. Ingest local PDFs into DB documents queue
         raw_dir = source_dir or self.cfg.raw_pdf_dir
         if raw_dir.exists():
-            pdf_files = list(raw_dir.glob("*.pdf"))
+            pdf_files = list(raw_dir.glob("*.pdf")) + list(raw_dir.glob("*/*.pdf"))
             logger.info(f"Discovered {len(pdf_files)} PDF files in {raw_dir}")
             for pdf_file in pdf_files:
                 self.queue_document_from_file(pdf_file)
@@ -91,6 +95,12 @@ class LegalRAGPipeline:
                 logger.info("No more pending documents in queue.")
                 break
 
+            # Fast resume skip via tracker
+            if resume and self.tracker.is_completed(doc_record.sha256_hash):
+                logger.info(f"[{doc_record.id}] Document already exported. Skipping.")
+                metrics["skipped"] += 1
+                continue
+
             metrics["total"] += 1
             success = self.process_document(doc_record)
             if success:
@@ -99,6 +109,10 @@ class LegalRAGPipeline:
                 metrics["failed"] += 1
 
             count += 1
+
+        # Sync state manifest to GCS
+        self.tracker.save_local()
+        self.tracker.sync_to_gcs()
 
         logger.info(f"Batch processing completed: {metrics}")
         return metrics
@@ -115,6 +129,13 @@ class LegalRAGPipeline:
             raw_bytes = file_path.read_bytes()
             doc_id, sha256_hash = generate_doc_id(raw_bytes)
             file_size = len(raw_bytes)
+
+            # Register in state tracker
+            self.tracker.register_document(file_path, raw_bytes)
+
+            if self.tracker.is_completed(sha256_hash):
+                logger.debug(f"Document {file_path.name} already completed in tracker.")
+                return doc_id
 
             sql = """
                 INSERT INTO documents (id, sha256_hash, source_filename, file_size_bytes, status)
@@ -200,11 +221,13 @@ class LegalRAGPipeline:
 
         try:
             raw_bytes = raw_path.read_bytes()
+            sha256 = doc_record.sha256_hash
 
             # Stage 1: Parse
             parse_result = self.parser.parse_pdf(raw_bytes, filename_hint=raw_path.name)
             self._save_parsed_pages(parse_result)
             self._update_doc_status(doc_id, "parsed", total_pages=parse_result.total_pages)
+            self.tracker.update_stage(sha256, "parsed", status="parsed", total_pages=parse_result.total_pages)
 
             # Stage 2: Hierarchical Chunking
             parent_chunks = self.chunker.chunk_document(
@@ -214,25 +237,41 @@ class LegalRAGPipeline:
             )
             self._save_chunks(parent_chunks)
             self._update_doc_status(doc_id, "chunked")
+            all_children = [c for p in parent_chunks for c in p.children]
+            self.tracker.update_stage(
+                sha256,
+                "chunked",
+                status="chunked",
+                parent_chunks=len(parent_chunks),
+                child_chunks=len(all_children),
+            )
 
             # Stage 3: Embedding Generation & pgvector Ingestion
-            all_children = [c for p in parent_chunks for c in p.children]
             child_texts = [c.content for c in all_children]
             embeddings = self.embedder.embed_texts(child_texts)
             self._save_embeddings(doc_id, all_children, embeddings)
             self._update_doc_status(doc_id, "embedded")
+            self.tracker.update_stage(sha256, "embedded", status="embedded")
 
             # Stage 4: Local Snapshots & GCS V2 Upload
             self._export_snapshots(parse_result, parent_chunks, all_children)
             self._update_doc_status(doc_id, "exported")
 
             elapsed_ms = int((time.time() - start_time) * 1000)
+            gcs_uris = {
+                "raw": f"gs://{self.cfg.gcs_bucket_name}/{self.cfg.gcs_raw_prefix}/{raw_path.name}",
+                "parsed": f"gs://{self.cfg.gcs_bucket_name}/{self.cfg.gcs_parsed_prefix}/parsed_{doc_id}.jsonl",
+                "chunks": f"gs://{self.cfg.gcs_bucket_name}/{self.cfg.gcs_chunks_prefix}/chunks_{doc_id}.jsonl",
+            }
+            self.tracker.mark_completed(sha256, gcs_uris=gcs_uris, execution_time_ms=elapsed_ms)
+
             self._log_stage(doc_id, "pipeline", "success", f"Processed in {elapsed_ms}ms", elapsed_ms)
             logger.info(f"[{doc_id}] Successfully processed & exported in {elapsed_ms}ms.")
             return True
 
         except Exception as e:
             logger.exception(f"[{doc_id}] Error in pipeline: {e}")
+            self.tracker.mark_failed(doc_record.sha256_hash, str(e))
             self._record_failure(doc_id, str(e))
             return False
 
@@ -445,24 +484,39 @@ class LegalRAGPipeline:
         except Exception as e:
             logger.debug(f"GCS upload fallback (file saved locally): {e}")
 
-    def _pull_raw_from_gcs(self) -> None:
-        """Pull raw PDFs from GCS bucket /raw/ partition."""
+    def _pull_raw_from_gcs(self, year: Optional[str] = None) -> None:
+        """
+        Pull pure raw PDFs from GCS bucket /raw/ partition.
+        Explicitly skips any temporary folders like chroma/, chunks/, parsed/, logs/.
+        """
         try:
             from google.cloud import storage
             client = storage.Client(project=self.cfg.gcp_project_id)
             bucket = client.bucket(self.cfg.gcs_bucket_name)
-            prefix = self.cfg.gcs_raw_prefix.strip("/") + "/"
-            blobs = bucket.list_blobs(prefix=prefix)
+
+            prefixes = [f"{self.cfg.gcs_raw_prefix.strip('/')}/"]
+            if year:
+                prefixes = [
+                    f"{self.cfg.gcs_raw_prefix.strip('/')}/year={year}/",
+                    f"year={year}/",
+                ]
 
             count = 0
-            for blob in blobs:
-                if blob.name.endswith(".pdf"):
-                    filename = Path(blob.name).name
-                    dest = self.cfg.raw_pdf_dir / filename
-                    if not dest.exists():
-                        blob.download_to_filename(str(dest))
-                        count += 1
-            logger.info(f"Pulled {count} new raw PDFs from gs://{self.cfg.gcs_bucket_name}/{prefix}")
+            for prefix in prefixes:
+                blobs = bucket.list_blobs(prefix=prefix)
+                for blob in blobs:
+                    # Ignore temporary subfolders inside raw partition
+                    name_lower = blob.name.lower()
+                    if any(temp in name_lower for temp in ["/chroma/", "/chunks/", "/parsed/", "/logs/"]):
+                        continue
+                    if blob.name.endswith(".pdf"):
+                        filename = Path(blob.name).name
+                        dest = self.cfg.raw_pdf_dir / filename
+                        if not dest.exists():
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            blob.download_to_filename(str(dest))
+                            count += 1
+            logger.info(f"Pulled {count} new raw PDFs from gs://{self.cfg.gcs_bucket_name}/")
         except Exception as e:
             logger.warning(f"Could not pull from GCS ({e}). Using local raw directory.")
 

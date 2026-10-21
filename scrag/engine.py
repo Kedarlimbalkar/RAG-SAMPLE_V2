@@ -279,3 +279,4 @@ class LegalRAGEngine:
 
 
 engine = LegalRAGEngine()
+

@@ -120,3 +120,4 @@ class CrossEncoderReranker:
 
 
 reranker = CrossEncoderReranker()
+

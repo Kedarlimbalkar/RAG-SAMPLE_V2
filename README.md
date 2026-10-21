@@ -80,16 +80,20 @@ pip install -e .
 python -m pytest -v tests/
 ```
 
-### 6. Run CLI Batch Runner
+### 6. Run CLI Batch Runner & State Tracking
 ```bash
 # Process raw PDFs from local directory (data/raw_pdfs)
 python -m scrag run
 
-# Pull raw PDFs from GCS V2 bucket (gs://sc-legal-rag-data-v2/raw/) and process
-python -m scrag run --from-gcs --limit 50
+# Pull raw PDFs for a specific year from GCS V2 bucket and process
+python -m scrag run --from-gcs --year 1950 --limit 50
 
-# Check pipeline state & document lifecycle counts
-python -m scrag status
+# Inspect execution state tracker metrics & resume progress
+python -m scrag tracker-status
+
+# Clean up legacy/temporary subfolders from GCS raw directory
+python -m scrag cleanup --year 1950 --dry-run
+python -m scrag cleanup --year 1950
 ```
 
 ### 7. Launch Gemini-Style Legal RAG Web UI
@@ -131,9 +135,10 @@ The project integrates with Google Cloud Platform using **Keyless Authentication
 
 | Partition | GCS Path | Purpose |
 |---|---|---|
-| **Raw PDFs** | `gs://sc-legal-rag-data-v2/raw/` | Inbound Supreme Court judgment PDF documents |
-| **Parsed Stream** | `gs://sc-legal-rag-data-v2/parsed-v2/` | Cleaned text streams and page offset maps |
-| **Hierarchical Chunks** | `gs://sc-legal-rag-data-v2/chunks-v2/` | Section-aware parent (~1500w) and child (~350w) chunks |
+| **Raw PDFs** | `gs://sc-legal-rag-data-v2/raw/` (e.g. `raw/year=1950/*.pdf`) | Pure, untouched Supreme Court judgment PDF documents |
+| **Parsed Stream** | `gs://sc-legal-rag-data-v2/parsed-v2/` | Cleaned text streams and page offset maps (`parsed_{doc_id}.jsonl`) |
+| **Hierarchical Chunks** | `gs://sc-legal-rag-data-v2/chunks-v2/` | Section-aware parent (~1500w) and child (~350w) chunks (`chunks_{doc_id}.jsonl`) |
+| **State Tracker** | `gs://sc-legal-rag-data-v2/tracker-v2/` | Central execution state tracker manifest (`state_tracker.json`) |
 | **Snapshots Archive** | `gs://sc-legal-rag-data-v2/snapshots-v2/` | Snappy-compressed Parquet and JSONL audit snapshots |
 
 ### 2. GitHub Actions CI/CD (`.github/workflows/ci-cd.yml`)

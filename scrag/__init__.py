@@ -28,6 +28,7 @@ from scrag.pipeline import LegalRAGPipeline, pipeline
 from scrag.reranker import CrossEncoderReranker, reranker
 from scrag.retriever import HybridRetriever, SearchResult, retriever
 from scrag.router import QueryIntent, QueryRouter, RetrievalStrategy, router
+from scrag.tracker import ExecutionTracker, FileTrackRecord, tracker
 
 __version__ = "0.2.0"
 
@@ -67,5 +68,8 @@ __all__ = [
     "LegalRAGEngine",
     "LegalQueryResult",
     "engine",
+    "ExecutionTracker",
+    "FileTrackRecord",
+    "tracker",
 ]
 
