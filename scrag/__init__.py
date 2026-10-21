@@ -23,8 +23,11 @@ from scrag.parser import (
     normalize_smart_quotes_and_symbols,
     resolve_char_span_to_pages,
 )
+from scrag.engine import LegalQueryResult, LegalRAGEngine, engine
 from scrag.pipeline import LegalRAGPipeline, pipeline
+from scrag.reranker import CrossEncoderReranker, reranker
 from scrag.retriever import HybridRetriever, SearchResult, retriever
+from scrag.router import QueryIntent, QueryRouter, RetrievalStrategy, router
 
 __version__ = "0.2.0"
 
@@ -55,5 +58,14 @@ __all__ = [
     "HybridRetriever",
     "SearchResult",
     "retriever",
+    "QueryIntent",
+    "QueryRouter",
+    "RetrievalStrategy",
+    "router",
+    "CrossEncoderReranker",
+    "reranker",
+    "LegalRAGEngine",
+    "LegalQueryResult",
+    "engine",
 ]
 

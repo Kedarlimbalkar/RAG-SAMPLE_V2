@@ -469,3 +469,4 @@ class LegalRAGPipeline:
 
 # Global pipeline instance
 pipeline = LegalRAGPipeline()
+

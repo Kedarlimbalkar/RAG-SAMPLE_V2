@@ -86,3 +86,4 @@ class TestHierarchicalChunker:
                 assert "appellant is acquitted" not in p.content
             if p.section_name == "Order/Judgement":
                 assert "incident occurred on 15th August" not in p.content
+

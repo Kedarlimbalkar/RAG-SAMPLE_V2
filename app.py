@@ -26,7 +26,8 @@ import streamlit as st
 
 from scrag.config import settings
 from scrag.database import db
-from scrag.retriever import SearchResult, retriever
+from scrag.engine import LegalQueryResult, engine
+from scrag.retriever import SearchResult
 
 
 # =============================================================================
@@ -69,6 +70,24 @@ st.markdown(
         border-radius: 9999px;
         text-transform: uppercase;
         letter-spacing: 0.05em;
+    }
+    .badge-intent {
+        background-color: #f3e8ff;
+        color: #6b21a8;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 0.2rem 0.55rem;
+        border-radius: 6px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    .badge-confidence {
+        background-color: #ecfdf5;
+        color: #047857;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 0.2rem 0.55rem;
+        border-radius: 6px;
     }
     .status-pill {
         display: inline-flex;
@@ -325,6 +344,18 @@ if "messages" not in st.session_state:
 # Render chat history
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
+        if intent_val := message.get("intent"):
+            conf_val = message.get("confidence", 0.0)
+            ms_val = message.get("execution_ms", 0)
+            st.markdown(
+                f'<div style="margin-bottom: 0.5rem; display: flex; gap: 0.4rem; align-items: center;">'
+                f'<span class="badge-intent">{intent_val}</span>'
+                f'<span class="badge-confidence">Confidence: {conf_val:.0%}</span>'
+                f'<small style="color: #64748b;">({ms_val}ms)</small>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
         st.markdown(message["content"])
 
         # Render expandable citations if present
@@ -346,37 +377,41 @@ for message in st.session_state.messages:
                     )
 
 # User query submission handler
-if user_query := st.chat_input("Enter your legal query or citation... (e.g. 'Doctrine of basic structure in constitutional amendments')"):
+if user_query := st.chat_input("Enter your legal query or citation... (e.g. 'Compare rulings on Article 21' or 'Doctrine of basic structure')"):
     # Append and render user message
     st.session_state.messages.append({"role": "user", "content": user_query, "citations": []})
     with st.chat_message("user"):
         st.markdown(user_query)
 
-    # Execute Hybrid Retrieval & LLM Generation
+    # Execute Intent Routing, Hybrid Retrieval, Re-ranking, and Guarded Synthesis
     with st.chat_message("assistant"):
-        with st.spinner("Searching pgvector & synthesizing authoritative legal citations..."):
-            start_t = time.time()
-            retrieved_results = retriever.search(
+        with st.spinner("Routing intent, searching pgvector & re-ranking legal authorities..."):
+            query_result = engine.execute_query(
                 query=user_query,
-                top_k=top_k,
-                vector_weight=vector_weight,
-                keyword_weight=keyword_weight,
-            )
-            elapsed_s = round(time.time() - start_t, 3)
-
-            # Generate synthesis
-            response_text = generate_legal_response(
-                query=user_query,
-                results=retrieved_results,
                 provider=llm_provider,
                 api_key=api_key,
+                custom_top_k=top_k,
+                custom_vector_weight=vector_weight,
             )
 
-            st.markdown(response_text)
+            # Header badges
+            st.markdown(
+                f'<div style="margin-bottom: 0.6rem; display: flex; gap: 0.4rem; align-items: center;">'
+                f'<span class="badge-intent">Intent: {query_result.intent.value}</span>'
+                f'<span class="badge-confidence">Confidence: {query_result.confidence_score:.0%}</span>'
+                f'<small style="color: #64748b;">({query_result.execution_time_ms}ms • {query_result.retrieved_docs_count} authorities)</small>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-            citations_data = [r.to_dict() for r in retrieved_results]
+            st.markdown(query_result.answer)
+
+            citations_data = [r.to_dict() for r in query_result.citations]
             if citations_data:
-                with st.expander(f"📚 View {len(citations_data)} Supporting Legal Citations (Retrieved in {elapsed_s}s)", expanded=True):
+                with st.expander(
+                    f"📚 View {len(citations_data)} Supporting Legal Citations ({query_result.execution_time_ms}ms)",
+                    expanded=True,
+                ):
                     for idx, cit in enumerate(citations_data, start=1):
                         st.markdown(
                             f"""
@@ -395,7 +430,11 @@ if user_query := st.chat_input("Enter your legal query or citation... (e.g. 'Doc
             st.session_state.messages.append(
                 {
                     "role": "assistant",
-                    "content": response_text,
+                    "content": query_result.answer,
                     "citations": citations_data,
+                    "intent": query_result.intent.value,
+                    "confidence": query_result.confidence_score,
+                    "execution_ms": query_result.execution_time_ms,
                 }
             )
+

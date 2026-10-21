@@ -65,9 +65,12 @@ class HybridRetriever:
         top_k: int = 5,
         vector_weight: float = 0.7,
         keyword_weight: float = 0.3,
+        min_distinct_docs: int = 1,
+        boost_sections: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """
         Execute hybrid search query across PostgreSQL chunks and embeddings.
+        Supports multi-document diversity and section boosting.
         """
         if not query.strip():
             return []
@@ -77,8 +80,8 @@ class HybridRetriever:
             query_vector = embedder.embed_query(query)
             str_vector = f"[{','.join(str(x) for x in query_vector)}]"
 
-            dense_results = self._execute_dense_search(str_vector, top_k * 2)
-            sparse_results = self._execute_sparse_search(query, top_k * 2)
+            dense_results = self._execute_dense_search(str_vector, top_k * 3)
+            sparse_results = self._execute_sparse_search(query, top_k * 3)
 
             # Fuse rankings using Reciprocal Rank Fusion (RRF)
             fused = self._reciprocal_rank_fusion(
@@ -87,6 +90,8 @@ class HybridRetriever:
                 vector_weight=vector_weight,
                 keyword_weight=keyword_weight,
                 top_k=top_k,
+                min_distinct_docs=min_distinct_docs,
+                boost_sections=boost_sections or [],
             )
             return fused
         except Exception as e:
@@ -140,14 +145,16 @@ class HybridRetriever:
         vector_weight: float,
         keyword_weight: float,
         top_k: int,
+        min_distinct_docs: int = 1,
+        boost_sections: Optional[List[str]] = None,
         k: int = 60,
     ) -> List[SearchResult]:
         """
-        Reciprocal Rank Fusion with dense/sparse weighting.
-        RRF Score = (vector_weight / (k + rank_dense)) + (keyword_weight / (k + rank_sparse))
+        Reciprocal Rank Fusion with dense/sparse weighting, section boosts, and multi-doc diversity.
         """
         scores: Dict[str, float] = {}
         items: Dict[str, Dict[str, Any]] = {}
+        boosted = set(boost_sections or [])
 
         for rank, row in enumerate(dense_results):
             cid = str(row["chunk_id"])
@@ -160,10 +167,35 @@ class HybridRetriever:
                 items[cid] = row
             scores[cid] = scores.get(cid, 0.0) + keyword_weight * (1.0 / (k + rank + 1))
 
-        sorted_cids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)[:top_k]
+        # Apply section boosts
+        if boosted:
+            for cid, score in list(scores.items()):
+                sec = items[cid].get("section_name", "")
+                if sec in boosted:
+                    scores[cid] = score * 1.25
+
+        # Multi-document diversity filter
+        all_sorted_cids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+        selected_cids: List[str] = []
+        docs_represented: set = set()
+
+        # First pass: ensure diversity if min_distinct_docs > 1
+        if min_distinct_docs > 1:
+            for cid in all_sorted_cids:
+                d_id = str(items[cid].get("doc_id"))
+                if d_id not in docs_represented and len(docs_represented) < min_distinct_docs:
+                    selected_cids.append(cid)
+                    docs_represented.add(d_id)
+
+        # Fill remaining slots up to top_k
+        for cid in all_sorted_cids:
+            if cid not in selected_cids:
+                selected_cids.append(cid)
+            if len(selected_cids) >= top_k:
+                break
 
         results: List[SearchResult] = []
-        for cid in sorted_cids:
+        for cid in selected_cids:
             row = items[cid]
             results.append(
                 SearchResult(
@@ -193,3 +225,4 @@ class HybridRetriever:
 
 
 retriever = HybridRetriever()
+

@@ -18,12 +18,13 @@ on:
       action:
         description: "Pipeline Execution Action"
         required: true
-        default: "verify-gcs-v2"
+        default: "execute-cloud-run-job"
         type: choice
         options:
-          - verify-gcs-v2
-          - sync-raw-and-batch-process
+          - execute-cloud-run-job
           - deploy-pipeline-worker
+          - sync-raw-and-batch-process
+          - verify-gcs-v2
       batch_limit:
         description: "Maximum documents to process in batch run"
         required: false
@@ -178,4 +179,14 @@ jobs:
           echo "Target Environment: ${{ github.event.inputs.environment || 'production' }}"
           echo "Pipeline configuration verified against gs://${GCS_BUCKET_NAME}."
           echo "Worker components deployed successfully."
+
+      # ------------------------------------------------------------------------
+      # Execute Cloud Run Batch Job
+      # ------------------------------------------------------------------------
+      - name: Execute Cloud Run Batch Job
+        if: ${{ github.event.inputs.action == 'execute-cloud-run-job' || github.event.inputs.action == 'deploy-pipeline-worker' || github.event_name == 'push' }}
+        run: |
+          gcloud run jobs execute sc-rag-pipeline-job \
+            --region=asia-south1 \
+            --wait
 

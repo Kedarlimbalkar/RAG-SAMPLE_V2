@@ -108,3 +108,4 @@ class LocalEmbedder:
 
 # Global embedder instance
 embedder = LocalEmbedder()
+

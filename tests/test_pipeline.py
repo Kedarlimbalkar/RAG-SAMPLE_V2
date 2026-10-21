@@ -60,3 +60,4 @@ class TestLegalRAGPipeline:
             # Verify local snapshots were created
             snapshots = list(pipeline.cfg.snapshot_dir.glob("*.jsonl"))
             assert len(snapshots) >= 2  # parsed and chunks jsonl
+
