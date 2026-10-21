@@ -72,11 +72,29 @@ This launches PostgreSQL 16 with `pgvector` and `pg_trgm` extensions enabled and
 ### 4. Install Dependencies
 ```bash
 pip install -r requirements.txt
+pip install -e .
 ```
 
-### 5. Run Parser Test Suite
+### 5. Run Test Suite
 ```bash
-python -m pytest -v tests/test_parser.py
+python -m pytest -v tests/
+```
+
+### 6. Run CLI Batch Runner
+```bash
+# Process raw PDFs from local directory (data/raw_pdfs)
+python -m scrag run
+
+# Pull raw PDFs from GCS V2 bucket (gs://sc-legal-rag-data-v2/raw/) and process
+python -m scrag run --from-gcs --limit 50
+
+# Check pipeline state & document lifecycle counts
+python -m scrag status
+```
+
+### 7. Launch Gemini-Style Legal RAG Web UI
+```bash
+streamlit run app.py
 ```
 
 ---
