@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scrag"
+version = "0.2.0"
+description = "Production-grade Legal RAG Pipeline for Supreme Court of India judgments"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Kedar Limbalkar", email = "kedarlimbalkar@gmail.com" }
+]
+dependencies = [
+    "pymupdf>=1.24.0",
+    "pytesseract>=0.3.10",
+    "pillow>=10.1.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "python-dotenv>=1.0.0",
+    "psycopg2-binary>=2.9.9",
+    "sqlalchemy>=2.0.25",
+    "pgvector>=0.2.4",
+    "torch>=2.1.0",
+    "sentence-transformers>=2.3.0",
+    "transformers>=4.36.0",
+    "google-cloud-storage>=2.14.0",
+    "pandas>=2.1.0",
+    "pyarrow>=14.0.0",
+    "click>=8.1.7",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scrag*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
