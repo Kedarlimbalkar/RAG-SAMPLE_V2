@@ -135,7 +135,7 @@ The automated workflow executes:
 ### 3. Required GitHub Repository Secrets
 
 Configure the following secrets in **Settings > Secrets and variables > Actions**:
-- `GCP_WIF_PROVIDER`: `projects/<PROJECT_NUM>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>`
-- `GCP_WIF_SERVICE_ACCOUNT`: `github-actions-sa@sc-legal-rag-prod.iam.gserviceaccount.com`
+- `WIF_PROVIDER`: `projects/<PROJECT_NUM>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>`
+- `WIF_SERVICE_ACCOUNT`: `github-actions-sa@sc-legal-rag-prod.iam.gserviceaccount.com`
 
 

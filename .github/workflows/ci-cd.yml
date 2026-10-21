@@ -44,8 +44,8 @@ env:
   GCS_PARSED_PREFIX: "parsed-v2"
   GCS_CHUNKS_PREFIX: "chunks-v2"
   GCS_SNAPSHOTS_PREFIX: "snapshots-v2"
-  WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
-  WIF_SERVICE_ACCOUNT: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+  WIF_PROVIDER: ${{ secrets.WIF_PROVIDER }}
+  WIF_SERVICE_ACCOUNT: ${{ secrets.WIF_SERVICE_ACCOUNT }}
 
 jobs:
   # ============================================================================
@@ -130,25 +130,22 @@ jobs:
       # ------------------------------------------------------------------------
       # Keyless Authentication via Google Cloud Workload Identity Federation
       # ------------------------------------------------------------------------
-      - name: Authenticate to Google Cloud via OIDC
-        if: env.WIF_PROVIDER != ''
-        id: gcp-auth
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          project_id: ${{ env.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ env.WIF_PROVIDER }}
-          service_account: ${{ env.WIF_SERVICE_ACCOUNT }}
-          token_format: access_token
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          token_format: 'access_token'
+          create_credentials_file: true
+          export_environment_variables: true
 
       - name: Set up Google Cloud SDK
-        if: env.WIF_PROVIDER != ''
         uses: google-github-actions/setup-gcloud@v2
 
       # ------------------------------------------------------------------------
       # V2 GCS Bucket Connectivity & Partition Verification
       # ------------------------------------------------------------------------
       - name: Verify GCS V2 Bucket Access & Structure
-        if: env.WIF_PROVIDER != ''
         run: |
           echo "Connecting to dedicated V2 bucket: gs://${GCS_BUCKET_NAME} in ${GCP_REGION}..."
           gcloud storage ls gs://${GCS_BUCKET_NAME}
@@ -158,7 +155,7 @@ jobs:
       # Conditional Action: Sync Raw & Run Batch Processing
       # ------------------------------------------------------------------------
       - name: Execute Batch Processing Sync
-        if: ${{ env.WIF_PROVIDER != '' && github.event.inputs.action == 'sync-raw-and-batch-process' }}
+        if: ${{ github.event.inputs.action == 'sync-raw-and-batch-process' }}
         run: |
           echo "Syncing raw judgments from gs://${GCS_BUCKET_NAME}/${GCS_RAW_PREFIX}/..."
           python scripts/gcs_sync.py download-raw --dest data/raw_pdfs
@@ -173,15 +170,9 @@ jobs:
       # Conditional Action: Deploy Pipeline Worker Component
       # ------------------------------------------------------------------------
       - name: Deploy Pipeline Worker
-        if: ${{ env.WIF_PROVIDER != '' && (github.event.inputs.action == 'deploy-pipeline-worker' || github.event_name == 'push') }}
+        if: ${{ github.event.inputs.action == 'deploy-pipeline-worker' || github.event_name == 'push' }}
         run: |
           echo "Target Environment: ${{ github.event.inputs.environment || 'production' }}"
           echo "Pipeline configuration verified against gs://${GCS_BUCKET_NAME}."
           echo "Worker components deployed successfully."
-
-      - name: Check GCP Secrets Status
-        if: env.WIF_PROVIDER == ''
-        run: |
-          echo "::warning::GCP_WIF_PROVIDER or GCP_WIF_SERVICE_ACCOUNT secret is not configured in repository settings."
-          echo "Keyless GCP OIDC authentication will activate automatically once secrets are configured."
 
