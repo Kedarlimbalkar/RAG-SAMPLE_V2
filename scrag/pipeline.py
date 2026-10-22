@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 def resolve_raw_prefixes(base_prefix: str, year: Optional[str] = None) -> List[str]:
     """
     Resolve recursive candidate prefixes for raw PDF traversal in GCS.
-    Ensures 'raw/Files-for-test/' and all nested 'year=*' folders are covered.
+    Ensures 'raw/Files-for-test/year=YYYY/english/' and all nested structures are covered.
     """
     clean = base_prefix.strip("/")
     candidates: List[str] = []
@@ -46,12 +46,18 @@ def resolve_raw_prefixes(base_prefix: str, year: Optional[str] = None) -> List[s
     if year:
         y_part = f"year={year}" if not str(year).startswith("year=") else str(year)
         if "Files-for-test" in clean:
+            candidates.append(f"{clean}/{y_part}/english/")
             candidates.append(f"{clean}/{y_part}/")
         else:
+            candidates.append(f"{clean}/Files-for-test/{y_part}/english/")
             candidates.append(f"{clean}/Files-for-test/{y_part}/")
+            candidates.append(f"{clean}/{y_part}/english/")
             candidates.append(f"{clean}/{y_part}/")
+        candidates.append(f"raw/Files-for-test/{y_part}/english/")
         candidates.append(f"raw/Files-for-test/{y_part}/")
+        candidates.append(f"Files-for-test/{y_part}/english/")
         candidates.append(f"Files-for-test/{y_part}/")
+        candidates.append(f"{y_part}/english/")
         candidates.append(f"{y_part}/")
     else:
         if "Files-for-test" in clean:

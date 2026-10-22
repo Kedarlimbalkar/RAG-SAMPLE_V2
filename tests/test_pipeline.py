@@ -23,8 +23,12 @@ class TestLegalRAGPipeline:
 
         # Specific year
         pfx_year = resolve_raw_prefixes("raw", year="1950")
+        assert "raw/Files-for-test/year=1950/english/" in pfx_year
         assert "raw/Files-for-test/year=1950/" in pfx_year
         assert "raw/year=1950/" in pfx_year
+
+        pfx_1951 = resolve_raw_prefixes("raw", year="1951")
+        assert "raw/Files-for-test/year=1951/english/" in pfx_1951
 
     def test_structured_snapshot_and_parquet_generation(self):
         pdf_bytes = create_synthetic_pdf(num_pages=2)
