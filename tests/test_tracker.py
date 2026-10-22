@@ -8,11 +8,36 @@ import tempfile
 from pathlib import Path
 import pytest
 
-from scrag.tracker import ExecutionTracker, FileTrackRecord
+from scrag.tracker import ExecutionTracker, FileTrackRecord, extract_year_from_path
 
 
 class TestExecutionTracker:
     """Validate document state tracking, stage transitions, and persistence."""
+
+    def test_extract_year_from_path(self):
+        assert extract_year_from_path("raw/Files-for-test/year=1950/case.pdf") == "1950"
+        assert extract_year_from_path("gs://bucket/raw/Files-for-test/year=1952/doc.pdf") == "1952"
+        assert extract_year_from_path("data/raw_pdfs/1953_SCR_1.pdf") == "1953"
+        assert extract_year_from_path("some/random/file.pdf") == "unknown"
+        assert extract_year_from_path("some/random/file.pdf", fallback="1950") == "1950"
+
+    def test_blob_completion_fast_skip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state_tracker.json"
+            tracker = ExecutionTracker(state_file=state_file)
+
+            raw_bytes = b"%PDF sample data"
+            rec = tracker.register_document(
+                "case.pdf",
+                raw_bytes,
+                year="1950",
+                gcs_blob_name="raw/Files-for-test/year=1950/case.pdf",
+            )
+            assert tracker.is_blob_completed("raw/Files-for-test/year=1950/case.pdf") is False
+
+            tracker.mark_completed(rec.sha256)
+            assert tracker.is_blob_completed("raw/Files-for-test/year=1950/case.pdf") is True
+            assert tracker.is_blob_completed("raw/Files-for-test/year=1950/other.pdf") is False
 
     def test_document_registration_and_year_extraction(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -86,3 +111,4 @@ class TestExecutionTracker:
             assert loaded_rec is not None
             assert loaded_rec.status == "parsed"
             assert loaded_rec.total_pages == 5
+

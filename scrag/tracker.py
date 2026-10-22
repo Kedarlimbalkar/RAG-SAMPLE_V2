@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+import re
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
@@ -22,6 +23,23 @@ from scrag.ids import compute_sha256, generate_doc_id
 logger = logging.getLogger(__name__)
 
 
+def extract_year_from_path(path_or_uri: Union[str, Path], fallback: Optional[str] = None) -> str:
+    """
+    Extract 4-digit year partition from file path or GCS blob name.
+    Supports 'year=YYYY' directory patterns and 4-digit year tokens.
+    """
+    path_str = str(path_or_uri).replace("\\", "/")
+    # 1. Explicit year=YYYY pattern
+    m = re.search(r"year=(\d{4})", path_str, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # 2. 4-digit year token (1900-2099)
+    m = re.search(r"(?:^|[/_\-\s])(19\d{2}|20\d{2})(?:[/_\-\s]|$)", path_str)
+    if m:
+        return m.group(1)
+    return fallback or "unknown"
+
+
 @dataclass
 class FileTrackRecord:
     """Detailed state record for an individual judgment document."""
@@ -29,6 +47,7 @@ class FileTrackRecord:
     sha256: str
     source_file: str
     year_partition: Optional[str] = None
+    gcs_blob_name: Optional[str] = None
     status: str = "pending"  # pending, parsed, chunked, embedded, exported, failed
     current_stage: str = "pending"
     stages_completed: List[str] = field(default_factory=list)
@@ -46,7 +65,9 @@ class FileTrackRecord:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> FileTrackRecord:
-        return cls(**data)
+        known = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return cls(**filtered)
 
 
 class ExecutionTracker:
@@ -106,6 +127,7 @@ class ExecutionTracker:
         file_path: Union[str, Path],
         raw_bytes: bytes,
         year: Optional[str] = None,
+        gcs_blob_name: Optional[str] = None,
     ) -> FileTrackRecord:
         """
         Register a file into the tracker. Returns existing record if already known.
@@ -115,21 +137,26 @@ class ExecutionTracker:
         doc_id, _ = generate_doc_id(sha256)
         doc_id_str = str(doc_id)
 
-        # Detect year from path (e.g. year=1950/case.pdf) if not provided
+        # Detect year from path or gcs_blob_name if not provided
         if not year:
-            for part in path.parts:
-                if part.startswith("year="):
-                    year = part.split("=")[1]
-                    break
+            detected = extract_year_from_path(gcs_blob_name or file_path)
+            if detected != "unknown":
+                year = detected
 
         if sha256 in self._records:
-            return self._records[sha256]
+            rec = self._records[sha256]
+            if gcs_blob_name and not rec.gcs_blob_name:
+                rec.gcs_blob_name = gcs_blob_name
+            if year and not rec.year_partition:
+                rec.year_partition = year
+            return rec
 
         record = FileTrackRecord(
             doc_id=doc_id_str,
             sha256=sha256,
             source_file=path.name,
             year_partition=year,
+            gcs_blob_name=gcs_blob_name,
             status="pending",
             current_stage="pending",
         )
@@ -210,6 +237,26 @@ class ExecutionTracker:
         rec = self._records.get(sha256)
         return rec is not None and rec.status == "exported"
 
+    def is_blob_completed(self, blob_name: str) -> bool:
+        """
+        Check if a GCS blob name has already been fully processed and exported.
+        Matches by exact gcs_blob_name or by filename and year partition.
+        """
+        clean_blob = blob_name.replace("\\", "/")
+        file_name = Path(clean_blob).name
+
+        for rec in self._records.values():
+            if rec.status == "exported":
+                if rec.gcs_blob_name and rec.gcs_blob_name == clean_blob:
+                    return True
+                if rec.source_file == file_name:
+                    if rec.year_partition:
+                        if f"year={rec.year_partition}" in clean_blob or f"/{rec.year_partition}/" in clean_blob:
+                            return True
+                    else:
+                        return True
+        return False
+
     def get_record(self, sha256: str) -> Optional[FileTrackRecord]:
         return self._records.get(sha256)
 
@@ -289,3 +336,4 @@ class ExecutionTracker:
 
 # Global tracker instance
 tracker = ExecutionTracker()
+

@@ -64,8 +64,20 @@ def cli() -> None:
     default=None,
     help="Optional year partition filter (e.g. '1950').",
 )
+@click.option(
+    "--prefix",
+    "-p",
+    type=str,
+    default=None,
+    help="GCS raw prefix to scan (default: settings.gcs_raw_prefix).",
+)
 def run_pipeline(
-    source: Path, from_gcs: bool, limit: Optional[int], resume: bool, year: Optional[str]
+    source: Path,
+    from_gcs: bool,
+    limit: Optional[int],
+    resume: bool,
+    year: Optional[str],
+    prefix: Optional[str],
 ) -> None:
     """
     Execute batch processing pipeline (parse, chunk, embed, pgvector, and export).
@@ -75,6 +87,7 @@ def run_pipeline(
     click.echo(f"  Source Directory : {source}")
     click.echo(f"  Year Partition   : {year or 'All'}")
     click.echo(f"  GCS Sync Active  : {from_gcs} (gs://{settings.gcs_bucket_name})")
+    click.echo(f"  GCS Raw Prefix   : {prefix or settings.gcs_raw_prefix}")
     click.echo(f"  Document Limit   : {limit or 'Unlimited'}")
     click.echo(f"  Resume Mode      : {resume}")
     click.echo("=" * 70)
@@ -86,6 +99,7 @@ def run_pipeline(
             limit=limit,
             resume=resume,
             year=year,
+            gcs_prefix=prefix,
         )
         click.secho(
             f"\nPipeline Run Complete! Processed: {metrics['processed']} | "

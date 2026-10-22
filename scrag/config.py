@@ -60,10 +60,11 @@ class Settings(BaseSettings):
     gcp_project_id: str = Field(default="sc-legal-rag-prod", alias="GCP_PROJECT_ID")
     gcp_region: str = Field(default="asia-south1", alias="GCP_REGION")
     gcs_bucket_name: str = Field(default="sc-legal-rag-data-v2", alias="GCS_BUCKET_NAME")
-    gcs_raw_prefix: str = Field(default="raw", alias="GCS_RAW_PREFIX")
+    gcs_raw_prefix: str = Field(default="raw/Files-for-test", alias="GCS_RAW_PREFIX")
     gcs_parsed_prefix: str = Field(default="parsed-v2", alias="GCS_PARSED_PREFIX")
     gcs_chunks_prefix: str = Field(default="chunks-v2", alias="GCS_CHUNKS_PREFIX")
     gcs_snapshots_prefix: str = Field(default="snapshots-v2", alias="GCS_SNAPSHOTS_PREFIX")
+    gcs_tracker_prefix: str = Field(default="tracker-v2", alias="GCS_TRACKER_PREFIX")
 
     # --------------------------------------------------------------------------
     # PDF Parser Tuning Parameters

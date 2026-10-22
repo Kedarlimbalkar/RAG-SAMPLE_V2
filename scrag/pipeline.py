@@ -15,11 +15,12 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 from scrag.chunker import HierarchicalChunker, ParentChunk
@@ -29,9 +30,47 @@ from scrag.embedder import LocalEmbedder, embedder
 from scrag.ids import compute_sha256, generate_doc_id
 from scrag.models import DocumentRecord
 from scrag.parser import DocumentParseResult, SupremeCourtParser
-from scrag.tracker import ExecutionTracker, tracker
+from scrag.tracker import ExecutionTracker, extract_year_from_path, tracker
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_raw_prefixes(base_prefix: str, year: Optional[str] = None) -> List[str]:
+    """
+    Resolve recursive candidate prefixes for raw PDF traversal in GCS.
+    Ensures 'raw/Files-for-test/' and all nested 'year=*' folders are covered.
+    """
+    clean = base_prefix.strip("/")
+    candidates: List[str] = []
+
+    if year:
+        y_part = f"year={year}" if not str(year).startswith("year=") else str(year)
+        if "Files-for-test" in clean:
+            candidates.append(f"{clean}/{y_part}/")
+        else:
+            candidates.append(f"{clean}/Files-for-test/{y_part}/")
+            candidates.append(f"{clean}/{y_part}/")
+        candidates.append(f"raw/Files-for-test/{y_part}/")
+        candidates.append(f"Files-for-test/{y_part}/")
+        candidates.append(f"{y_part}/")
+    else:
+        if "Files-for-test" in clean:
+            candidates.append(f"{clean}/")
+        else:
+            candidates.append(f"{clean}/Files-for-test/")
+            candidates.append(f"{clean}/")
+        candidates.append("raw/Files-for-test/")
+        candidates.append("Files-for-test/")
+        candidates.append("raw/")
+
+    # Deduplicate while preserving order
+    seen: Set[str] = set()
+    result: List[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
 
 
 class LegalRAGPipeline:
@@ -48,6 +87,72 @@ class LegalRAGPipeline:
         self.cfg.ensure_directories()
 
     # --------------------------------------------------------------------------
+    # GCS Blob Discovery & Database Registration
+    # --------------------------------------------------------------------------
+    def list_gcs_raw_blobs(
+        self, prefix: Optional[str] = None, year: Optional[str] = None
+    ) -> List[Any]:
+        """
+        Recursively find all raw PDF blobs under target GCS prefix (e.g. raw/Files-for-test/).
+        Filters out temporary subfolders (chroma/, chunks/, parsed/, logs/) and non-PDFs.
+        """
+        try:
+            from google.cloud import storage
+            client = storage.Client(project=self.cfg.gcp_project_id)
+            bucket = client.bucket(self.cfg.gcs_bucket_name)
+
+            base_prefix = prefix or self.cfg.gcs_raw_prefix
+            prefixes = resolve_raw_prefixes(base_prefix, year=year)
+
+            logger.info(f"Scanning GCS prefixes for raw PDFs in gs://{self.cfg.gcs_bucket_name}: {prefixes}")
+
+            discovered: List[Any] = []
+            seen_names: Set[str] = set()
+
+            for pfx in prefixes:
+                blobs = bucket.list_blobs(prefix=pfx)
+                for blob in blobs:
+                    b_name = blob.name
+                    if b_name in seen_names:
+                        continue
+                    seen_names.add(b_name)
+
+                    # Skip temporary subfolders
+                    name_lower = b_name.lower()
+                    if any(temp in name_lower for temp in ["/chroma/", "/chunks/", "/parsed/", "/logs/", "/tmp/"]):
+                        continue
+
+                    # Filter only valid PDFs
+                    if name_lower.endswith(".pdf"):
+                        # If year filter is active, verify year matches
+                        if year:
+                            blob_year = extract_year_from_path(b_name)
+                            if str(year) != blob_year:
+                                continue
+                        discovered.append(blob)
+
+            logger.info(f"Discovered {len(discovered)} valid raw PDF blobs in GCS.")
+            return discovered
+        except Exception as e:
+            logger.warning(f"Could not list blobs from GCS ({e}).")
+            return []
+
+    def _register_doc_in_db(
+        self, doc_id: uuid.UUID, sha256_hash: str, filename: str, file_size: int
+    ) -> None:
+        """Register document in PostgreSQL documents queue."""
+        sql = """
+            INSERT INTO documents (id, sha256_hash, source_filename, file_size_bytes, status)
+            VALUES (%s, %s, %s, %s, 'pending')
+            ON CONFLICT (sha256_hash) DO NOTHING;
+        """
+        try:
+            with db.get_cursor(commit=True) as cursor:
+                cursor.execute(sql, (str(doc_id), sha256_hash, filename, file_size))
+        except Exception as e:
+            logger.debug(f"DB insert document skipped/failed: {e}")
+
+    # --------------------------------------------------------------------------
     # Main Batch Runner Entry Point
     # --------------------------------------------------------------------------
     def run_batch(
@@ -57,62 +162,176 @@ class LegalRAGPipeline:
         limit: Optional[int] = None,
         resume: bool = True,
         year: Optional[str] = None,
+        gcs_prefix: Optional[str] = None,
     ) -> Dict[str, int]:
         """
         Execute batch processing on raw PDF documents.
+        Supports both direct recursive GCS streaming and local directory batches.
 
         Args:
             source_dir: Local path containing raw PDFs (default: data/raw_pdfs).
-            from_gcs: If True, pulls raw PDFs from gs://sc-legal-rag-data-v2/raw/.
+            from_gcs: If True, recursively pulls & processes PDFs from GCS.
             limit: Maximum documents to process in this run.
-            resume: If True, picks up unfinished documents from database state.
+            resume: If True, skips documents already exported according to state tracker.
             year: Optional year partition filter (e.g. '1950').
+            gcs_prefix: Optional custom GCS prefix to scan.
 
         Returns:
             Dict[str, int]: Processing outcome metrics.
         """
         metrics = {"total": 0, "processed": 0, "skipped": 0, "failed": 0}
-
-        # 1. Optionally sync inbound raw PDFs from GCS
-        if from_gcs:
-            self._pull_raw_from_gcs(year=year)
-
-        # 2. Ingest local PDFs into DB documents queue
-        raw_dir = source_dir or self.cfg.raw_pdf_dir
-        if raw_dir.exists():
-            pdf_files = list(raw_dir.glob("*.pdf")) + list(raw_dir.glob("*/*.pdf"))
-            logger.info(f"Discovered {len(pdf_files)} PDF files in {raw_dir}")
-            for pdf_file in pdf_files:
-                self.queue_document_from_file(pdf_file)
-
-        # 3. Process queued documents with transactional locking
         batch_limit = limit or 1000000
         count = 0
 
-        while count < batch_limit:
-            doc_record = self._claim_next_document()
-            if not doc_record:
-                logger.info("No more pending documents in queue.")
-                break
+        # Sync remote tracker if resuming
+        if resume and from_gcs:
+            self.tracker.sync_from_gcs()
 
-            # Fast resume skip via tracker
-            if resume and self.tracker.is_completed(doc_record.sha256_hash):
-                logger.info(f"[{doc_record.id}] Document already exported. Skipping.")
-                metrics["skipped"] += 1
-                continue
+        if from_gcs:
+            # ==================================================================
+            # GCS Recursive Traversal & Direct Batch Processing
+            # ==================================================================
+            blobs = self.list_gcs_raw_blobs(prefix=gcs_prefix, year=year)
+            logger.info(f"Processing GCS batch: {len(blobs)} candidates found.")
 
-            metrics["total"] += 1
-            success = self.process_document(doc_record)
-            if success:
-                metrics["processed"] += 1
-            else:
-                metrics["failed"] += 1
+            for blob in blobs:
+                if count >= batch_limit:
+                    logger.info(f"Reached batch limit of {batch_limit}. Stopping.")
+                    break
 
-            count += 1
+                blob_name = blob.name
+                blob_year = extract_year_from_path(blob_name, fallback=year or "unknown")
 
-        # Sync state manifest to GCS
+                # Level 1 fast-resume check: Skip if already completed in tracker
+                if resume and self.tracker.is_blob_completed(blob_name):
+                    logger.info(f"Blob already completed according to tracker: {blob_name}. Skipping.")
+                    metrics["skipped"] += 1
+                    continue
+
+                logger.info(f"Streaming {blob_name} (year={blob_year})...")
+                try:
+                    raw_bytes = blob.download_as_bytes()
+                except Exception as e:
+                    logger.error(f"Failed to download blob {blob_name}: {e}")
+                    metrics["failed"] += 1
+                    continue
+
+                sha256 = compute_sha256(raw_bytes)
+                doc_id, _ = generate_doc_id(sha256)
+
+                # Level 2 fast-resume check: Skip if content SHA-256 already completed
+                if resume and self.tracker.is_completed(sha256):
+                    logger.info(f"[{doc_id}] Document SHA-256 already completed. Skipping.")
+                    metrics["skipped"] += 1
+                    continue
+
+                # Local cache copy for audit / inspectability
+                filename = Path(blob_name).name
+                local_dir = self.cfg.raw_pdf_dir / f"year={blob_year}"
+                local_dir.mkdir(parents=True, exist_ok=True)
+                local_file = local_dir / filename
+                if not local_file.exists():
+                    try:
+                        local_file.write_bytes(raw_bytes)
+                    except Exception as e:
+                        logger.debug(f"Local cache write skipped: {e}")
+
+                # Register in tracker & database
+                self.tracker.register_document(
+                    local_file,
+                    raw_bytes,
+                    year=blob_year,
+                    gcs_blob_name=blob_name,
+                )
+                self._register_doc_in_db(doc_id, sha256, filename, len(raw_bytes))
+
+                doc_record = DocumentRecord(
+                    id=doc_id,
+                    sha256_hash=sha256,
+                    source_filename=filename,
+                    file_size_bytes=len(raw_bytes),
+                    status="pending",
+                )
+
+                metrics["total"] += 1
+                success = self.process_document(
+                    doc_record,
+                    raw_bytes=raw_bytes,
+                    year=blob_year,
+                    gcs_blob_name=blob_name,
+                )
+                if success:
+                    metrics["processed"] += 1
+                else:
+                    metrics["failed"] += 1
+
+                count += 1
+
+                # Periodically sync tracker manifest to GCS (every 10 docs)
+                if count % 10 == 0:
+                    self.tracker.save_local()
+                    self.tracker.sync_to_gcs()
+
+        else:
+            # ==================================================================
+            # Local Filesystem Traversal
+            # ==================================================================
+            raw_dir = source_dir or self.cfg.raw_pdf_dir
+            if raw_dir.exists():
+                pdf_files = [p for p in raw_dir.rglob("*.pdf") if p.is_file()]
+                logger.info(f"Discovered {len(pdf_files)} local PDF files under {raw_dir}")
+
+                for pdf_file in pdf_files:
+                    if count >= batch_limit:
+                        break
+
+                    file_year = extract_year_from_path(pdf_file, fallback=year or "unknown")
+                    if year and str(year) != file_year:
+                        continue
+
+                    try:
+                        raw_bytes = pdf_file.read_bytes()
+                    except Exception as e:
+                        logger.error(f"Failed to read local file {pdf_file}: {e}")
+                        metrics["failed"] += 1
+                        continue
+
+                    sha256 = compute_sha256(raw_bytes)
+                    doc_id, _ = generate_doc_id(sha256)
+
+                    if resume and self.tracker.is_completed(sha256):
+                        logger.info(f"[{doc_id}] Document {pdf_file.name} already exported. Skipping.")
+                        metrics["skipped"] += 1
+                        continue
+
+                    self.tracker.register_document(pdf_file, raw_bytes, year=file_year)
+                    self._register_doc_in_db(doc_id, sha256, pdf_file.name, len(raw_bytes))
+
+                    doc_record = DocumentRecord(
+                        id=doc_id,
+                        sha256_hash=sha256,
+                        source_filename=pdf_file.name,
+                        file_size_bytes=len(raw_bytes),
+                        status="pending",
+                    )
+
+                    metrics["total"] += 1
+                    success = self.process_document(
+                        doc_record,
+                        raw_bytes=raw_bytes,
+                        year=file_year,
+                    )
+                    if success:
+                        metrics["processed"] += 1
+                    else:
+                        metrics["failed"] += 1
+
+                    count += 1
+
+        # Final state sync
         self.tracker.save_local()
-        self.tracker.sync_to_gcs()
+        if from_gcs:
+            self.tracker.sync_to_gcs()
 
         logger.info(f"Batch processing completed: {metrics}")
         return metrics
@@ -129,30 +348,17 @@ class LegalRAGPipeline:
             raw_bytes = file_path.read_bytes()
             doc_id, sha256_hash = generate_doc_id(raw_bytes)
             file_size = len(raw_bytes)
+            file_year = extract_year_from_path(file_path)
 
             # Register in state tracker
-            self.tracker.register_document(file_path, raw_bytes)
+            self.tracker.register_document(file_path, raw_bytes, year=file_year)
 
             if self.tracker.is_completed(sha256_hash):
                 logger.debug(f"Document {file_path.name} already completed in tracker.")
                 return doc_id
 
-            sql = """
-                INSERT INTO documents (id, sha256_hash, source_filename, file_size_bytes, status)
-                VALUES (%s, %s, %s, %s, 'pending')
-                ON CONFLICT (sha256_hash) DO NOTHING
-                RETURNING id;
-            """
-            try:
-                with db.get_cursor(commit=True) as cursor:
-                    cursor.execute(sql, (str(doc_id), sha256_hash, file_path.name, file_size))
-                    res = cursor.fetchone()
-                    if res:
-                        logger.info(f"Queued document {file_path.name} (id={doc_id})")
-                    return doc_id
-            except Exception as e:
-                logger.debug(f"Queue DB insert skipped/failed: {e}")
-                return doc_id
+            self._register_doc_in_db(doc_id, sha256_hash, file_path.name, file_size)
+            return doc_id
         except Exception as e:
             logger.error(f"Error reading file {file_path}: {e}")
             return None
@@ -196,35 +402,51 @@ class LegalRAGPipeline:
     # --------------------------------------------------------------------------
     # Single Document Lifecycle Execution
     # --------------------------------------------------------------------------
-    def process_document(self, doc_record: DocumentRecord) -> bool:
+    def process_document(
+        self,
+        doc_record: DocumentRecord,
+        raw_bytes: Optional[bytes] = None,
+        year: Optional[str] = None,
+        gcs_blob_name: Optional[str] = None,
+    ) -> bool:
         """
         Run document through full pipeline lifecycle:
         1. Parse (scrag.parser)
         2. Chunk (scrag.chunker)
         3. Embed & Index (scrag.embedder + pgvector)
-        4. Snapshot & GCS V2 Export
+        4. Snapshot & GCS V2 Structured Export (JSONL & Parquet under year=YYYY/)
         """
         doc_id = doc_record.id
         start_time = time.time()
         logger.info(f"[{doc_id}] Processing document {doc_record.source_filename} (status={doc_record.status})...")
 
-        raw_path = self.cfg.raw_pdf_dir / (doc_record.source_filename or f"{doc_id}.pdf")
-        if not raw_path.exists():
-            # Try searching in raw directory by sha256 or filename
-            found = list(self.cfg.raw_pdf_dir.glob(f"*{doc_record.sha256_hash[:8]}*.pdf"))
-            if found:
-                raw_path = found[0]
+        # Resolve raw bytes if not supplied
+        if raw_bytes is None:
+            raw_path = self.cfg.raw_pdf_dir / (doc_record.source_filename or f"{doc_id}.pdf")
+            if not raw_path.exists():
+                # Try recursive search under raw directory
+                found = list(self.cfg.raw_pdf_dir.rglob(f"*{doc_record.source_filename}*"))
+                if not found:
+                    found = list(self.cfg.raw_pdf_dir.rglob(f"*{doc_record.sha256_hash[:8]}*.pdf"))
+                if found:
+                    raw_path = found[0]
 
-        if not raw_path.exists():
-            self._record_failure(doc_id, f"Raw PDF not found on disk: {raw_path}")
-            return False
+            if not raw_path.exists():
+                self._record_failure(doc_id, f"Raw PDF not found on disk: {raw_path}")
+                return False
+
+            try:
+                raw_bytes = raw_path.read_bytes()
+            except Exception as e:
+                self._record_failure(doc_id, f"Could not read PDF bytes from disk: {e}")
+                return False
 
         try:
-            raw_bytes = raw_path.read_bytes()
             sha256 = doc_record.sha256_hash
+            doc_year = year or extract_year_from_path(gcs_blob_name or doc_record.source_filename or "", fallback="unknown")
 
             # Stage 1: Parse
-            parse_result = self.parser.parse_pdf(raw_bytes, filename_hint=raw_path.name)
+            parse_result = self.parser.parse_pdf(raw_bytes, filename_hint=doc_record.source_filename)
             self._save_parsed_pages(parse_result)
             self._update_doc_status(doc_id, "parsed", total_pages=parse_result.total_pages)
             self.tracker.update_stage(sha256, "parsed", status="parsed", total_pages=parse_result.total_pages)
@@ -253,18 +475,15 @@ class LegalRAGPipeline:
             self._update_doc_status(doc_id, "embedded")
             self.tracker.update_stage(sha256, "embedded", status="embedded")
 
-            # Stage 4: Local Snapshots & GCS V2 Upload
-            self._export_snapshots(parse_result, parent_chunks, all_children)
+            # Stage 4: Local Snapshots & GCS V2 Structured Upload
+            gcs_uris = self._export_snapshots(parse_result, parent_chunks, all_children, year=doc_year)
             self._update_doc_status(doc_id, "exported")
 
             elapsed_ms = int((time.time() - start_time) * 1000)
-            gcs_uris = {
-                "raw": f"gs://{self.cfg.gcs_bucket_name}/{self.cfg.gcs_raw_prefix}/{raw_path.name}",
-                "parsed": f"gs://{self.cfg.gcs_bucket_name}/{self.cfg.gcs_parsed_prefix}/parsed_{doc_id}.jsonl",
-                "chunks": f"gs://{self.cfg.gcs_bucket_name}/{self.cfg.gcs_chunks_prefix}/chunks_{doc_id}.jsonl",
-            }
-            self.tracker.mark_completed(sha256, gcs_uris=gcs_uris, execution_time_ms=elapsed_ms)
+            if gcs_blob_name:
+                gcs_uris["raw"] = f"gs://{self.cfg.gcs_bucket_name}/{gcs_blob_name}"
 
+            self.tracker.mark_completed(sha256, gcs_uris=gcs_uris, execution_time_ms=elapsed_ms)
             self._log_stage(doc_id, "pipeline", "success", f"Processed in {elapsed_ms}ms", elapsed_ms)
             logger.info(f"[{doc_id}] Successfully processed & exported in {elapsed_ms}ms.")
             return True
@@ -439,38 +658,120 @@ class LegalRAGPipeline:
             logger.debug(f"DB log stage skipped: {e}")
 
     # --------------------------------------------------------------------------
-    # Snapshot Export & GCS V2 Upload
+    # Snapshot Export & Structured GCS V2 Upload
     # --------------------------------------------------------------------------
     def _export_snapshots(
         self,
         parse_result: DocumentParseResult,
         parents: List[ParentChunk],
         children: List[Any],
-    ) -> None:
+        year: str = "unknown",
+    ) -> Dict[str, str]:
         """
-        Export local JSONL/Parquet snapshots and upload to GCS V2 partitions:
-        - parsed-v2/
-        - chunks-v2/
-        - snapshots-v2/
+        Export JSONL and Parquet snapshots and upload to structured GCS V2 partitions:
+        - gs://sc-legal-rag-data-v2/parsed-v2/year=YYYY/
+        - gs://sc-legal-rag-data-v2/chunks-v2/year=YYYY/
         """
         doc_id_str = str(parse_result.doc_id)
+        year_clean = str(year).strip()
+        year_partition = f"year={year_clean}" if not year_clean.startswith("year=") else year_clean
+
         snap_dir = self.cfg.snapshot_dir
+        snap_year_dir = snap_dir / year_partition
         snap_dir.mkdir(parents=True, exist_ok=True)
+        snap_year_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Parsed snapshot
+        gcs_uris: Dict[str, str] = {}
+
+        # 1. Parsed snapshot (JSONL) - saved in both root snapshot_dir and snap_year_dir
+        parsed_payload = json.dumps(parse_result.to_dict()) + "\n"
         parsed_file = snap_dir / f"parsed_{doc_id_str}.jsonl"
+        parsed_year_file = snap_year_dir / f"parsed_{doc_id_str}.jsonl"
         with open(parsed_file, "w", encoding="utf-8") as f:
-            f.write(json.dumps(parse_result.to_dict()) + "\n")
+            f.write(parsed_payload)
+        if parsed_year_file != parsed_file:
+            with open(parsed_year_file, "w", encoding="utf-8") as f:
+                f.write(parsed_payload)
 
-        # 2. Chunks snapshot
+        # 2. Parsed snapshot (Parquet)
+        parsed_parquet = snap_year_dir / f"parsed_{doc_id_str}.parquet"
+        try:
+            import pandas as pd
+            stitched = parse_result.stitched_text or ""
+            parsed_row = {
+                "doc_id": doc_id_str,
+                "sha256_hash": parse_result.sha256_hash,
+                "year": year_clean,
+                "total_pages": parse_result.total_pages,
+                "file_size_bytes": getattr(parse_result, "file_size_bytes", len(stitched)),
+                "total_chars": len(stitched),
+                "total_words": len(stitched.split()),
+                "stitched_text": stitched,
+                "page_offset_map": json.dumps({str(k): v for k, v in parse_result.page_offset_map.items()}),
+                "detected_headers": json.dumps(getattr(parse_result, "detected_headers", [])),
+                "detected_footers": json.dumps(getattr(parse_result, "detected_footers", [])),
+            }
+            pd.DataFrame([parsed_row]).to_parquet(parsed_parquet, engine="pyarrow", compression="snappy")
+        except Exception as e:
+            logger.warning(f"Parquet export for parsed failed: {e}")
+
+        # 3. Chunks snapshot (JSONL) - saved in both root snapshot_dir and snap_year_dir
+        chunks_payload = "".join(json.dumps(p.to_dict()) + "\n" for p in parents)
         chunks_file = snap_dir / f"chunks_{doc_id_str}.jsonl"
+        chunks_year_file = snap_year_dir / f"chunks_{doc_id_str}.jsonl"
         with open(chunks_file, "w", encoding="utf-8") as f:
-            for p in parents:
-                f.write(json.dumps(p.to_dict()) + "\n")
+            f.write(chunks_payload)
+        if chunks_year_file != chunks_file:
+            with open(chunks_year_file, "w", encoding="utf-8") as f:
+                f.write(chunks_payload)
 
-        # 3. Upload to GCS V2 partitions if GCS is configured
-        self._upload_file_to_gcs(parsed_file, f"{self.cfg.gcs_parsed_prefix}/{parsed_file.name}")
-        self._upload_file_to_gcs(chunks_file, f"{self.cfg.gcs_chunks_prefix}/{chunks_file.name}")
+        # 4. Chunks snapshot (Parquet)
+        chunks_parquet = snap_year_dir / f"chunks_{doc_id_str}.parquet"
+        try:
+            import pandas as pd
+            chunk_rows = []
+            for c in children:
+                chunk_rows.append({
+                    "doc_id": str(c.doc_id),
+                    "parent_id": str(c.parent_id),
+                    "chunk_id": str(c.id),
+                    "chunk_index": c.chunk_index,
+                    "section_name": c.section_name or "",
+                    "content": c.content or "",
+                    "word_count": c.word_count,
+                    "page_start": c.page_start,
+                    "page_end": c.page_end,
+                    "char_start": c.char_start,
+                    "char_end": c.char_end,
+                    "year": year_clean,
+                })
+            if chunk_rows:
+                pd.DataFrame(chunk_rows).to_parquet(chunks_parquet, engine="pyarrow", compression="snappy")
+        except Exception as e:
+            logger.debug(f"Parquet export for chunks skipped: {e}")
+
+        # 5. Upload to structured GCS partitions:
+        # gs://sc-legal-rag-data-v2/parsed-v2/year=YYYY/
+        # gs://sc-legal-rag-data-v2/chunks-v2/year=YYYY/
+        parsed_key = f"{self.cfg.gcs_parsed_prefix}/{year_partition}/{parsed_file.name}"
+        self._upload_file_to_gcs(parsed_file, parsed_key)
+        gcs_uris["parsed_jsonl"] = f"gs://{self.cfg.gcs_bucket_name}/{parsed_key}"
+
+        if parsed_parquet.exists():
+            parsed_pq_key = f"{self.cfg.gcs_parsed_prefix}/{year_partition}/{parsed_parquet.name}"
+            self._upload_file_to_gcs(parsed_parquet, parsed_pq_key)
+            gcs_uris["parsed_parquet"] = f"gs://{self.cfg.gcs_bucket_name}/{parsed_pq_key}"
+
+        chunks_key = f"{self.cfg.gcs_chunks_prefix}/{year_partition}/{chunks_file.name}"
+        self._upload_file_to_gcs(chunks_file, chunks_key)
+        gcs_uris["chunks_jsonl"] = f"gs://{self.cfg.gcs_bucket_name}/{chunks_key}"
+
+        if chunks_parquet.exists():
+            chunks_pq_key = f"{self.cfg.gcs_chunks_prefix}/{year_partition}/{chunks_parquet.name}"
+            self._upload_file_to_gcs(chunks_parquet, chunks_pq_key)
+            gcs_uris["chunks_parquet"] = f"gs://{self.cfg.gcs_bucket_name}/{chunks_pq_key}"
+
+        return gcs_uris
 
     def _upload_file_to_gcs(self, local_path: Path, remote_key: str) -> None:
         """Upload single snapshot file to GCS."""
