@@ -472,11 +472,24 @@ class LegalRAGPipeline:
             child_texts = [c.content for c in all_children]
             embeddings = self.embedder.embed_texts(child_texts)
             self._save_embeddings(doc_id, all_children, embeddings)
+            self._save_metadata(
+                doc_id=doc_id,
+                filename=doc_record.source_filename or f"{doc_id}.pdf",
+                year=doc_year,
+                stitched_text=parse_result.stitched_text,
+                total_pages=parse_result.total_pages,
+            )
             self._update_doc_status(doc_id, "embedded")
             self.tracker.update_stage(sha256, "embedded", status="embedded")
 
             # Stage 4: Local Snapshots & GCS V2 Structured Upload
-            gcs_uris = self._export_snapshots(parse_result, parent_chunks, all_children, year=doc_year)
+            gcs_uris = self._export_snapshots(
+                parse_result,
+                parent_chunks,
+                all_children,
+                year=doc_year,
+                source_filename=doc_record.source_filename,
+            )
             self._update_doc_status(doc_id, "exported")
 
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -604,6 +617,61 @@ class LegalRAGPipeline:
         except Exception as e:
             logger.debug(f"DB save embeddings skipped: {e}")
 
+    def _save_metadata(
+        self,
+        doc_id: uuid.UUID,
+        filename: str,
+        year: str,
+        stitched_text: str,
+        total_pages: int,
+    ) -> None:
+        """
+        Extract legal metadata (title, citation, bench, date) and upsert into metadata table.
+        """
+        header_sample = stitched_text[:2500] if stitched_text else ""
+        lines = [line.strip() for line in header_sample.split("\n") if line.strip()]
+
+        case_title = Path(filename).stem.replace("_", " ").replace("-", " ").title()
+        for line in lines[:15]:
+            if any(marker in line.lower() for marker in [" versus ", " vs. ", " v. "]):
+                case_title = line
+                break
+
+        citation = f"{year} INSC {doc_id.hex[:6].upper()}"
+        m = re.search(r"\b(19\d{2}|20\d{2})\s+AIR\s+\w+\s+\d+\b", header_sample, re.IGNORECASE)
+        if m:
+            citation = m.group(0)
+        else:
+            m = re.search(r"\b(19\d{2}|20\d{2})\s+SCR\s+\w*\s*\d+\b", header_sample, re.IGNORECASE)
+            if m:
+                citation = m.group(0)
+
+        judgment_date = None
+        if year and year != "unknown" and year.isdigit():
+            judgment_date = f"{year}-01-01"
+
+        sql = """
+            INSERT INTO metadata (
+                doc_id, case_title, citation, judgment_date, raw_metadata
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (doc_id) DO UPDATE SET
+                case_title = EXCLUDED.case_title,
+                citation = EXCLUDED.citation,
+                judgment_date = COALESCE(EXCLUDED.judgment_date, metadata.judgment_date),
+                updated_at = clock_timestamp();
+        """
+        try:
+            with db.get_cursor(commit=True) as cursor:
+                raw_meta = json.dumps({
+                    "filename": filename,
+                    "year": year,
+                    "total_pages": total_pages,
+                })
+                cursor.execute(sql, (str(doc_id), case_title, citation, judgment_date, raw_meta))
+        except Exception as e:
+            logger.debug(f"DB save metadata skipped: {e}")
+
     def _update_doc_status(
         self, doc_id: uuid.UUID, status: str, total_pages: Optional[int] = None
     ) -> None:
@@ -666,11 +734,14 @@ class LegalRAGPipeline:
         parents: List[ParentChunk],
         children: List[Any],
         year: str = "unknown",
+        source_filename: Optional[str] = None,
     ) -> Dict[str, str]:
         """
-        Export JSONL and Parquet snapshots and upload to structured GCS V2 partitions:
-        - gs://sc-legal-rag-data-v2/parsed-v2/year=YYYY/
-        - gs://sc-legal-rag-data-v2/chunks-v2/year=YYYY/
+        Export JSONL, JSON, and Parquet snapshots and upload to structured GCS V2 partitions:
+        - gs://sc-legal-rag-data-v2/parsed-v2/year=YYYY/[filename].json
+        - gs://sc-legal-rag-data-v2/chunks-v2/year=YYYY/[filename]_chunks.json
+        - gs://sc-legal-rag-data-v2/parsed-v2/year=YYYY/parsed_{doc_id}.parquet
+        - gs://sc-legal-rag-data-v2/chunks-v2/year=YYYY/chunks_{doc_id}.parquet
         """
         doc_id_str = str(parse_result.doc_id)
         year_clean = str(year).strip()
@@ -682,8 +753,15 @@ class LegalRAGPipeline:
         snap_year_dir.mkdir(parents=True, exist_ok=True)
 
         gcs_uris: Dict[str, str] = {}
+        stem = Path(source_filename).stem if source_filename else f"doc_{doc_id_str}"
 
-        # 1. Parsed snapshot (JSONL) - saved in both root snapshot_dir and snap_year_dir
+        # 1. Parsed snapshot (JSON) named after document stem:
+        # gs://sc-legal-rag-data-v2/parsed-v2/year=YYYY/[filename].json
+        parsed_doc_json = snap_year_dir / f"{stem}.json"
+        with open(parsed_doc_json, "w", encoding="utf-8") as f:
+            json.dump(parse_result.to_dict(), f, indent=2)
+
+        # 2. Parsed snapshot (JSONL) - saved in both root snapshot_dir and snap_year_dir
         parsed_payload = json.dumps(parse_result.to_dict()) + "\n"
         parsed_file = snap_dir / f"parsed_{doc_id_str}.jsonl"
         parsed_year_file = snap_year_dir / f"parsed_{doc_id_str}.jsonl"
@@ -693,7 +771,7 @@ class LegalRAGPipeline:
             with open(parsed_year_file, "w", encoding="utf-8") as f:
                 f.write(parsed_payload)
 
-        # 2. Parsed snapshot (Parquet)
+        # 3. Parsed snapshot (Parquet)
         parsed_parquet = snap_year_dir / f"parsed_{doc_id_str}.parquet"
         try:
             import pandas as pd
@@ -701,6 +779,7 @@ class LegalRAGPipeline:
             parsed_row = {
                 "doc_id": doc_id_str,
                 "sha256_hash": parse_result.sha256_hash,
+                "source_file": source_filename or f"{stem}.pdf",
                 "year": year_clean,
                 "total_pages": parse_result.total_pages,
                 "file_size_bytes": getattr(parse_result, "file_size_bytes", len(stitched)),
@@ -715,7 +794,21 @@ class LegalRAGPipeline:
         except Exception as e:
             logger.warning(f"Parquet export for parsed failed: {e}")
 
-        # 3. Chunks snapshot (JSONL) - saved in both root snapshot_dir and snap_year_dir
+        # 4. Chunks snapshot (JSON) named after document stem:
+        # gs://sc-legal-rag-data-v2/chunks-v2/year=YYYY/[filename]_chunks.json
+        chunks_doc_json = snap_year_dir / f"{stem}_chunks.json"
+        chunks_doc_payload = {
+            "doc_id": doc_id_str,
+            "source_file": source_filename or f"{stem}.pdf",
+            "year": year_clean,
+            "total_parents": len(parents),
+            "total_children": len(children),
+            "parent_chunks": [p.to_dict() for p in parents],
+        }
+        with open(chunks_doc_json, "w", encoding="utf-8") as f:
+            json.dump(chunks_doc_payload, f, indent=2)
+
+        # 5. Chunks snapshot (JSONL) - saved in both root snapshot_dir and snap_year_dir
         chunks_payload = "".join(json.dumps(p.to_dict()) + "\n" for p in parents)
         chunks_file = snap_dir / f"chunks_{doc_id_str}.jsonl"
         chunks_year_file = snap_year_dir / f"chunks_{doc_id_str}.jsonl"
@@ -725,7 +818,7 @@ class LegalRAGPipeline:
             with open(chunks_year_file, "w", encoding="utf-8") as f:
                 f.write(chunks_payload)
 
-        # 4. Chunks snapshot (Parquet)
+        # 6. Chunks snapshot (Parquet)
         chunks_parquet = snap_year_dir / f"chunks_{doc_id_str}.parquet"
         try:
             import pandas as pd
@@ -750,9 +843,17 @@ class LegalRAGPipeline:
         except Exception as e:
             logger.debug(f"Parquet export for chunks skipped: {e}")
 
-        # 5. Upload to structured GCS partitions:
-        # gs://sc-legal-rag-data-v2/parsed-v2/year=YYYY/
-        # gs://sc-legal-rag-data-v2/chunks-v2/year=YYYY/
+        # 7. Upload to structured GCS partitions:
+        # - gs://sc-legal-rag-data-v2/parsed-v2/year=YYYY/[filename].json
+        # - gs://sc-legal-rag-data-v2/chunks-v2/year=YYYY/[filename]_chunks.json
+        parsed_doc_key = f"{self.cfg.gcs_parsed_prefix}/{year_partition}/{parsed_doc_json.name}"
+        self._upload_file_to_gcs(parsed_doc_json, parsed_doc_key)
+        gcs_uris["parsed_json"] = f"gs://{self.cfg.gcs_bucket_name}/{parsed_doc_key}"
+
+        chunks_doc_key = f"{self.cfg.gcs_chunks_prefix}/{year_partition}/{chunks_doc_json.name}"
+        self._upload_file_to_gcs(chunks_doc_json, chunks_doc_key)
+        gcs_uris["chunks_json"] = f"gs://{self.cfg.gcs_bucket_name}/{chunks_doc_key}"
+
         parsed_key = f"{self.cfg.gcs_parsed_prefix}/{year_partition}/{parsed_file.name}"
         self._upload_file_to_gcs(parsed_file, parsed_key)
         gcs_uris["parsed_jsonl"] = f"gs://{self.cfg.gcs_bucket_name}/{parsed_key}"

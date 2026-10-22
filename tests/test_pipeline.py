@@ -59,6 +59,8 @@ class TestLegalRAGPipeline:
             assert (year_snap_dir / f"chunks_{doc_id}.jsonl").exists()
             assert (year_snap_dir / f"parsed_{doc_id}.parquet").exists()
             assert (year_snap_dir / f"chunks_{doc_id}.parquet").exists()
+            assert (year_snap_dir / f"1950_test_case.json").exists()
+            assert (year_snap_dir / f"1950_test_case_chunks.json").exists()
 
     def test_queue_document_idempotency(self):
         pdf_bytes = create_synthetic_pdf(num_pages=2)
